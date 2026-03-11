@@ -1,0 +1,9 @@
+{
+  "uuid": "rdp-activity@bczaplicki",
+  "name": "RDP Activity Indicator",
+  "description": "Shows a top-bar indicator when a GNOME Remote Desktop RDP session is active and displays connected client IP addresses.",
+  "shell-version": [
+    "46"
+  ],
+  "version": 1
+}

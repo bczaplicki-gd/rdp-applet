@@ -1,0 +1,23 @@
+.rdp-activity-label {
+    font-weight: 700;
+    letter-spacing: 0.1px;
+}
+
+.rdp-activity-dot {
+    margin-left: 6px;
+    min-width: 1.1em;
+    font-size: 1.15em;
+    font-weight: 800;
+}
+
+.rdp-activity-dot-connected {
+    color: #33d17a;
+}
+
+.rdp-activity-dot-available {
+    color: #f6d32d;
+}
+
+.rdp-activity-dot-unavailable {
+    color: #ed333b;
+}
