@@ -167,11 +167,18 @@ class RdpActivityIndicator extends PanelMenu.Button {
             can_focus: false,
         });
         this._clientsSection = new PopupMenu.PopupMenuSection();
+        this._actionItem = new PopupMenu.PopupMenuItem('');
+
+        this._actionItem.connect('activate', () => {
+            this._toggleRdpEnabled();
+        });
 
         this.menu.addMenuItem(this._stateItem);
         this.menu.addMenuItem(this._portItem);
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
         this.menu.addMenuItem(this._clientsSection);
+        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        this.menu.addMenuItem(this._actionItem);
 
         for (const key of ['enable', 'port', 'negotiate-port']) {
             this._settingsSignals.push(this._rdpSettings.connect(`changed::${key}`, () => {
@@ -201,13 +208,30 @@ class RdpActivityIndicator extends PanelMenu.Button {
         this._dot.remove_style_class_name('rdp-activity-dot-connected');
         this._dot.remove_style_class_name('rdp-activity-dot-available');
         this._dot.remove_style_class_name('rdp-activity-dot-unavailable');
-        this._dot.add_style_class_name(dotClass);
+
+        if (dotClass)
+            this._dot.add_style_class_name(dotClass);
+    }
+
+    _setActionLabel(label) {
+        this._actionItem.label.text = label;
+    }
+
+    _setOff() {
+        this._label.text = 'RDP OFF';
+        this._stateItem.label.text = 'RDP is disabled';
+        this._portItem.label.text = `Configured port: ${this._getConfiguredPort()}`;
+        this._setActionLabel('Turn On RDP');
+        this._setStatusDot(null, '');
+        this._rebuildClientItems([]);
+        this.show();
     }
 
     _setUnavailable(summary, details) {
         this._label.text = summary;
         this._stateItem.label.text = details;
         this._portItem.label.text = `Configured port: ${this._getConfiguredPort()}`;
+        this._setActionLabel('Turn Off RDP');
         this._setStatusDot('rdp-activity-dot-unavailable');
         this._rebuildClientItems([]);
         this.show();
@@ -217,6 +241,7 @@ class RdpActivityIndicator extends PanelMenu.Button {
         this._label.text = 'RDP available';
         this._stateItem.label.text = 'No active RDP client';
         this._portItem.label.text = `Configured port: ${this._getConfiguredPort()}`;
+        this._setActionLabel('Turn Off RDP');
         this._setStatusDot('rdp-activity-dot-available');
         this._rebuildClientItems([]);
         this.show();
@@ -235,6 +260,7 @@ class RdpActivityIndicator extends PanelMenu.Button {
             : `${clients.length} active RDP clients`;
 
         this._portItem.label.text = `Configured port: ${this._getConfiguredPort()}`;
+        this._setActionLabel('Turn Off RDP');
         this._setStatusDot('rdp-activity-dot-connected');
         this._rebuildClientItems(clients);
         this.show();
@@ -305,6 +331,12 @@ class RdpActivityIndicator extends PanelMenu.Button {
         }
     }
 
+    _toggleRdpEnabled() {
+        const enabled = this._rdpSettings.get_boolean('enable');
+        this._rdpSettings.set_boolean('enable', !enabled);
+        this._refresh();
+    }
+
     _buildClients(activeAddresses, tailscaleUsersByIp) {
         const nowSeconds = this._getNowSeconds();
 
@@ -331,7 +363,7 @@ class RdpActivityIndicator extends PanelMenu.Button {
         try {
             if (!this._rdpSettings.get_boolean('enable')) {
                 this._clientSince.clear();
-                this._setUnavailable('RDP NOT AVAILABLE', 'RDP is disabled');
+                this._setOff();
                 return;
             }
 
