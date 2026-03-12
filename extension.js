@@ -12,8 +12,10 @@ import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 const INDICATOR_NAME = 'rdp-activity-indicator';
 const REFRESH_INTERVAL_SECONDS = 3;
 const TAILSCALE_CACHE_SECONDS = 30;
+const LISTEN_PORT_MIN = 3389;
+const LISTEN_PORT_MAX = 3399;
+const DEFAULT_RDP_PORT = 3389;
 const RDP_SETTINGS_SCHEMA = 'org.gnome.desktop.remote-desktop.rdp';
-const GRD_SERVICE_NAME = 'gnome-remote-desktop.service';
 
 function normalizeAddress(address) {
     if (!address)
@@ -52,6 +54,155 @@ function parseClientAddresses(stdout) {
     }
 
     return [...addresses].sort((left, right) => left.localeCompare(right, undefined, {numeric: true}));
+}
+
+function parseListeningPorts(stdout) {
+    const ports = new Set();
+
+    for (const line of stdout.split('\n')) {
+        const trimmedLine = line.trim();
+        if (!trimmedLine)
+            continue;
+
+        const columns = trimmedLine.split(/\s+/);
+        const localAddress = columns.at(-2) ?? '';
+        const match = localAddress.match(/:(\d+)$/);
+        if (!match)
+            continue;
+
+        ports.add(Number.parseInt(match[1], 10));
+    }
+
+    return [...ports].sort((left, right) => left - right);
+}
+
+function parseGrdStatus(stdout, methodName) {
+    const info = {
+        methodName,
+        enabled: false,
+        configuredPort: null,
+        negotiatePort: false,
+        unitStatus: 'unknown',
+        actualPort: null,
+    };
+
+    for (const line of stdout.split('\n')) {
+        const trimmedLine = line.trim();
+        if (trimmedLine.startsWith('Unit status:')) {
+            info.unitStatus = trimmedLine.split(':').slice(1).join(':').trim();
+            continue;
+        }
+
+        if (trimmedLine.startsWith('Status:')) {
+            info.enabled = trimmedLine.split(':').slice(1).join(':').trim() === 'enabled';
+            continue;
+        }
+
+        if (trimmedLine.startsWith('Port:')) {
+            const rawPort = trimmedLine.split(':').slice(1).join(':').trim();
+            const parsedPort = Number.parseInt(rawPort, 10);
+            info.configuredPort = Number.isNaN(parsedPort) ? null : parsedPort;
+            continue;
+        }
+
+        if (trimmedLine.startsWith('Negotiate port:')) {
+            info.negotiatePort = trimmedLine.split(':').slice(1).join(':').trim() === 'yes';
+            continue;
+        }
+    }
+
+    return info;
+}
+
+function inferRemoteControlPort(remoteControl, listeningPorts) {
+    if (!remoteControl.enabled || remoteControl.unitStatus !== 'active')
+        return null;
+
+    const configuredPort = remoteControl.configuredPort;
+    const hasDefaultPort = listeningPorts.includes(DEFAULT_RDP_PORT);
+
+    if (configuredPort !== null && listeningPorts.includes(configuredPort)) {
+        if (configuredPort !== DEFAULT_RDP_PORT || listeningPorts.length === 1)
+            return configuredPort;
+    }
+
+    if (remoteControl.negotiatePort) {
+        for (const port of listeningPorts) {
+            if (port !== DEFAULT_RDP_PORT)
+                return port;
+        }
+    }
+
+    if (configuredPort === DEFAULT_RDP_PORT && hasDefaultPort)
+        return DEFAULT_RDP_PORT;
+
+    return null;
+}
+
+function inferRemoteLoginState(remoteControl, listeningPorts) {
+    const info = {
+        methodName: 'Remote Login',
+        enabled: false,
+        configuredPort: DEFAULT_RDP_PORT,
+        unitStatus: 'unknown',
+        actualPort: null,
+        inferred: true,
+    };
+
+    if (!listeningPorts.includes(DEFAULT_RDP_PORT))
+        return info;
+
+    if (remoteControl.actualPort === DEFAULT_RDP_PORT)
+        return info;
+
+    if (remoteControl.enabled && remoteControl.actualPort === null && listeningPorts.length === 1)
+        return info;
+
+    info.enabled = true;
+    info.unitStatus = 'active';
+    info.actualPort = DEFAULT_RDP_PORT;
+    return info;
+}
+
+function describeMethod(methodInfo) {
+    if (!methodInfo.enabled)
+        return `${methodInfo.methodName}: off`;
+
+    if (methodInfo.actualPort !== null) {
+        if (methodInfo.configuredPort === null || methodInfo.actualPort === methodInfo.configuredPort) {
+            const inferredNote = methodInfo.inferred ? ' (inferred)' : '';
+            return `${methodInfo.methodName}: available on ${methodInfo.actualPort}${inferredNote}`;
+        }
+
+        const inferredNote = methodInfo.inferred ? ' (inferred)' : '';
+        return `${methodInfo.methodName}: available on ${methodInfo.actualPort} (configured ${methodInfo.configuredPort})${inferredNote}`;
+    }
+
+    if (methodInfo.unitStatus !== 'active')
+        return `${methodInfo.methodName}: enabled, service ${methodInfo.unitStatus}`;
+
+    if (methodInfo.configuredPort !== null)
+        return `${methodInfo.methodName}: enabled, waiting on ${methodInfo.configuredPort}`;
+
+    return `${methodInfo.methodName}: enabled`;
+}
+
+function buildPortsSummary(remoteControl, remoteLogin, listeningPorts) {
+    const labels = [];
+
+    if (remoteControl.actualPort !== null)
+        labels.push(`control ${remoteControl.actualPort}`);
+
+    if (remoteLogin.actualPort !== null)
+        labels.push(`login ${remoteLogin.actualPort}`);
+
+    if (labels.length > 0)
+        return `Available ports: ${labels.join(' • ')}`;
+
+    if (listeningPorts.length > 0)
+        return `Listening ports: ${listeningPorts.join(', ')}`;
+
+    return 'No available RDP ports';
 }
 
 function formatDuration(seconds) {
@@ -147,6 +298,7 @@ class RdpActivityIndicator extends PanelMenu.Button {
             y_align: Clutter.ActorAlign.CENTER,
             style_class: 'rdp-activity-label',
         });
+
         this._dot = new St.Label({
             text: '',
             y_align: Clutter.ActorAlign.CENTER,
@@ -166,15 +318,18 @@ class RdpActivityIndicator extends PanelMenu.Button {
             reactive: false,
             can_focus: false,
         });
+        this._methodsSection = new PopupMenu.PopupMenuSection();
         this._clientsSection = new PopupMenu.PopupMenuSection();
         this._actionItem = new PopupMenu.PopupMenuItem('');
 
         this._actionItem.connect('activate', () => {
-            this._toggleRdpEnabled();
+            this._toggleRemoteControl();
         });
 
         this.menu.addMenuItem(this._stateItem);
         this.menu.addMenuItem(this._portItem);
+        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        this.menu.addMenuItem(this._methodsSection);
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
         this.menu.addMenuItem(this._clientsSection);
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
@@ -186,17 +341,12 @@ class RdpActivityIndicator extends PanelMenu.Button {
             }));
         }
 
-        this._setUnavailable('RDP NOT AVAILABLE', 'RDP is disabled or not running');
+        this._setOff('No available RDP ports', []);
         this._refresh();
         this._refreshSourceId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, REFRESH_INTERVAL_SECONDS, () => {
             this._refresh();
             return GLib.SOURCE_CONTINUE;
         });
-    }
-
-    _getConfiguredPort() {
-        const configuredPort = this._rdpSettings?.get_value('port')?.unpack?.() ?? 0;
-        return configuredPort > 0 ? configuredPort : 3389;
     }
 
     _getNowSeconds() {
@@ -217,60 +367,22 @@ class RdpActivityIndicator extends PanelMenu.Button {
         this._actionItem.label.text = label;
     }
 
-    _setOff() {
-        this._label.text = 'RDP OFF';
-        this._stateItem.label.text = 'RDP is disabled';
-        this._portItem.label.text = `Configured port: ${this._getConfiguredPort()}`;
-        this._setActionLabel('Turn On RDP');
-        this._setStatusDot(null, '');
-        this._rebuildClientItems([]);
-        this.show();
-    }
+    _rebuildMethodItems(methodLines) {
+        this._methodsSection.removeAll();
 
-    _setUnavailable(summary, details) {
-        this._label.text = summary;
-        this._stateItem.label.text = details;
-        this._portItem.label.text = `Configured port: ${this._getConfiguredPort()}`;
-        this._setActionLabel('Turn Off RDP');
-        this._setStatusDot('rdp-activity-dot-unavailable');
-        this._rebuildClientItems([]);
-        this.show();
-    }
-
-    _setAvailable() {
-        this._label.text = 'RDP available';
-        this._stateItem.label.text = 'No active RDP client';
-        this._portItem.label.text = `Configured port: ${this._getConfiguredPort()}`;
-        this._setActionLabel('Turn Off RDP');
-        this._setStatusDot('rdp-activity-dot-available');
-        this._rebuildClientItems([]);
-        this.show();
-    }
-
-    _setConnected(clients) {
-        const [firstClient] = clients;
-        const firstSummary = firstClient.username || firstClient.address;
-
-        this._label.text = clients.length === 1
-            ? `RDP ${firstSummary}`
-            : `RDP ${firstSummary} +${clients.length - 1}`;
-
-        this._stateItem.label.text = clients.length === 1
-            ? '1 active RDP client'
-            : `${clients.length} active RDP clients`;
-
-        this._portItem.label.text = `Configured port: ${this._getConfiguredPort()}`;
-        this._setActionLabel('Turn Off RDP');
-        this._setStatusDot('rdp-activity-dot-connected');
-        this._rebuildClientItems(clients);
-        this.show();
+        for (const line of methodLines) {
+            this._methodsSection.addMenuItem(new PopupMenu.PopupMenuItem(line, {
+                reactive: false,
+                can_focus: false,
+            }));
+        }
     }
 
     _rebuildClientItems(clients) {
         this._clientsSection.removeAll();
 
         if (clients.length === 0) {
-            this._clientsSection.addMenuItem(new PopupMenu.PopupMenuItem('No connected clients', {
+            this._clientsSection.addMenuItem(new PopupMenu.PopupMenuItem('No connected Remote Control clients', {
                 reactive: false,
                 can_focus: false,
             }));
@@ -289,6 +401,59 @@ class RdpActivityIndicator extends PanelMenu.Button {
         }
     }
 
+    _setOff(portsSummary, methodLines) {
+        this._label.text = 'RDP OFF';
+        this._stateItem.label.text = 'Remote Control is disabled';
+        this._portItem.label.text = portsSummary;
+        this._setActionLabel('Turn On Remote Control');
+        this._setStatusDot(null, '');
+        this._rebuildMethodItems(methodLines);
+        this._rebuildClientItems([]);
+        this.show();
+    }
+
+    _setUnavailable(details, portsSummary, methodLines) {
+        this._label.text = 'RDP NOT AVAILABLE';
+        this._stateItem.label.text = details;
+        this._portItem.label.text = portsSummary;
+        this._setActionLabel('Turn Off Remote Control');
+        this._setStatusDot('rdp-activity-dot-unavailable');
+        this._rebuildMethodItems(methodLines);
+        this._rebuildClientItems([]);
+        this.show();
+    }
+
+    _setAvailable(portsSummary, methodLines) {
+        this._label.text = 'RDP available';
+        this._stateItem.label.text = 'No active Remote Control client';
+        this._portItem.label.text = portsSummary;
+        this._setActionLabel('Turn Off Remote Control');
+        this._setStatusDot('rdp-activity-dot-available');
+        this._rebuildMethodItems(methodLines);
+        this._rebuildClientItems([]);
+        this.show();
+    }
+
+    _setConnected(clients, portsSummary, methodLines) {
+        const [firstClient] = clients;
+        const firstSummary = firstClient.username || firstClient.address;
+
+        this._label.text = clients.length === 1
+            ? `RDP ${firstSummary}`
+            : `RDP ${firstSummary} +${clients.length - 1}`;
+
+        this._stateItem.label.text = clients.length === 1
+            ? '1 active Remote Control client'
+            : `${clients.length} active Remote Control clients`;
+
+        this._portItem.label.text = portsSummary;
+        this._setActionLabel('Turn Off Remote Control');
+        this._setStatusDot('rdp-activity-dot-connected');
+        this._rebuildMethodItems(methodLines);
+        this._rebuildClientItems(clients);
+        this.show();
+    }
+
     _pruneClientSessions(activeAddresses) {
         const nowSeconds = this._getNowSeconds();
         const activeSet = new Set(activeAddresses);
@@ -304,9 +469,22 @@ class RdpActivityIndicator extends PanelMenu.Button {
         }
     }
 
-    async _getServiceState() {
-        const result = await runCommand(['systemctl', '--user', 'is-active', GRD_SERVICE_NAME]);
-        return result.stdout.trim() || result.stderr.trim() || 'inactive';
+    async _getRemoteControlStatus() {
+        const result = await runCommand(['grdctl', 'status']);
+        return parseGrdStatus(result.stdout, 'Remote Control');
+    }
+
+    async _getListeningPorts() {
+        const result = await runCommand([
+            'ss',
+            '-Hltn',
+            `( sport >= :${LISTEN_PORT_MIN} and sport <= :${LISTEN_PORT_MAX} )`,
+        ]);
+
+        if (!result.successful)
+            return [];
+
+        return parseListeningPorts(result.stdout);
     }
 
     async _getTailscaleUsers(activeAddresses) {
@@ -331,7 +509,25 @@ class RdpActivityIndicator extends PanelMenu.Button {
         }
     }
 
-    _toggleRdpEnabled() {
+    async _getActiveRemoteControlAddresses(remoteControlPort) {
+        if (remoteControlPort === null)
+            return [];
+
+        const result = await runCommand([
+            'ss',
+            '-Htn',
+            'state',
+            'established',
+            `( sport = :${remoteControlPort} )`,
+        ]);
+
+        if (!result.successful)
+            return [];
+
+        return parseClientAddresses(result.stdout);
+    }
+
+    _toggleRemoteControl() {
         const enabled = this._rdpSettings.get_boolean('enable');
         this._rdpSettings.set_boolean('enable', !enabled);
         this._refresh();
@@ -361,43 +557,44 @@ class RdpActivityIndicator extends PanelMenu.Button {
         this._refreshInFlight = true;
 
         try {
-            if (!this._rdpSettings.get_boolean('enable')) {
-                this._clientSince.clear();
-                this._setOff();
-                return;
-            }
-
-            const serviceState = await this._getServiceState();
-            if (this._destroyed)
-                return;
-
-            if (serviceState !== 'active') {
-                this._clientSince.clear();
-                this._setUnavailable('RDP NOT AVAILABLE', `Service state: ${serviceState}`);
-                return;
-            }
-
-            const result = await runCommand([
-                'ss',
-                '-Htn',
-                'state',
-                'established',
-                `( sport = :${this._getConfiguredPort()} )`,
+            const [remoteControl, listeningPorts] = await Promise.all([
+                this._getRemoteControlStatus(),
+                this._getListeningPorts(),
             ]);
 
             if (this._destroyed)
                 return;
 
-            if (!result.successful) {
-                this._setUnavailable('RDP NOT AVAILABLE', result.stderr.trim() || 'The ss command failed');
+            remoteControl.actualPort = inferRemoteControlPort(remoteControl, listeningPorts);
+            const remoteLogin = inferRemoteLoginState(remoteControl, listeningPorts);
+
+            const methodLines = [
+                describeMethod(remoteControl),
+                describeMethod(remoteLogin),
+            ];
+            const portsSummary = buildPortsSummary(remoteControl, remoteLogin, listeningPorts);
+
+            if (!remoteControl.enabled) {
+                this._clientSince.clear();
+                this._setOff(portsSummary, methodLines);
                 return;
             }
 
-            const activeAddresses = parseClientAddresses(result.stdout);
+            const anyMethodAvailable = remoteControl.actualPort !== null || remoteLogin.actualPort !== null;
+            if (!anyMethodAvailable) {
+                this._clientSince.clear();
+                this._setUnavailable(`Remote Control service ${remoteControl.unitStatus}`, portsSummary, methodLines);
+                return;
+            }
+
+            const activeAddresses = await this._getActiveRemoteControlAddresses(remoteControl.actualPort);
+            if (this._destroyed)
+                return;
+
             this._pruneClientSessions(activeAddresses);
 
             if (activeAddresses.length === 0) {
-                this._setAvailable();
+                this._setAvailable(portsSummary, methodLines);
                 return;
             }
 
@@ -405,10 +602,13 @@ class RdpActivityIndicator extends PanelMenu.Button {
             if (this._destroyed)
                 return;
 
-            this._setConnected(this._buildClients(activeAddresses, tailscaleUsersByIp));
+            this._setConnected(this._buildClients(activeAddresses, tailscaleUsersByIp), portsSummary, methodLines);
         } catch (error) {
             if (!this._destroyed)
-                this._setUnavailable('RDP NOT AVAILABLE', error.message);
+                this._setUnavailable(error.message, 'No available RDP ports', [
+                    'Remote Control: unknown',
+                    'Remote Login: unknown',
+                ]);
         } finally {
             this._refreshInFlight = false;
         }
