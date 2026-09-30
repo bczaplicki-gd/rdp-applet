@@ -2,6 +2,8 @@
 
 GNOME Shell extension that shows the current `gnome-remote-desktop` RDP status in the top bar.
 
+Supports GNOME Shell 46 and 50. Requires `gnome-remote-desktop` and `ss` (iproute2); Tailscale username lookup is optional.
+
 The panel now shows one of these states:
 
 - `RDP OFF` with no status dot when Remote Control is disabled
@@ -46,6 +48,8 @@ Then restart GNOME Shell or log out and back in, and enable the extension:
 ```bash
 gnome-extensions enable rdp-activity@bczaplicki
 ```
+
+After updating GNOME, run `make install` again to install the current compatibility metadata. On Wayland, log out and back in to load the update; toggling the extension does not reload its JavaScript modules.
 
 ## Notes
 
